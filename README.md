@@ -118,6 +118,17 @@ call; scoring ≈ 1 small call per job (the profile is prompt-cached across jobs
 ≈ 4 calls (tailor, fact-check, cover letter, form answers). `max_jobs_to_score` and
 `max_applications_per_run` keep spending bounded.
 
+## Try it without an API key (offline demo)
+
+```bash
+python demo/run_demo.py --seed 21          # outputs go to demo_output/
+```
+
+Generates a random candidate resume (DOCX) and ~30 random job postings, serves fake Lever and Greenhouse
+application sites locally, and runs the whole pipeline in a headless browser. Claude is replaced by a
+rule-based stand-in, so this tests the plumbing (search, filtering, tracking, tailoring flow, rendering,
+form filling, the safety gate, submission), not the quality of Claude's writing.
+
 ## Development
 
 ```bash
