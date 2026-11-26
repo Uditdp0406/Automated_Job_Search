@@ -33,7 +33,7 @@ class LLM:
         schema: type[T],
         effort: str = "medium",
         max_tokens: int = 16000,
-        cache_system: bool = True,
+        cache_system: bool = False,  # only worth it when the same system prompt is reused
     ) -> T:
         """One Claude call whose answer is validated against `schema`."""
         system_block = {"type": "text", "text": system}
@@ -56,6 +56,10 @@ class LLM:
             raise LLMError("Anthropic authentication failed - set ANTHROPIC_API_KEY.") from e
         except anthropic.BadRequestError as e:
             raise LLMError(f"Bad request to Claude: {e.message}") from e
+        except anthropic.RateLimitError as e:
+            raise LLMError("Rate limited by the Anthropic API (after retries) - try again later.") from e
+        except anthropic.APIStatusError as e:
+            raise LLMError(f"Anthropic API error {e.status_code}: {e.message}") from e
         except anthropic.APIConnectionError as e:
             raise LLMError("Could not reach the Anthropic API.") from e
 

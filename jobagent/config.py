@@ -20,6 +20,8 @@ class SearchConfig(BaseModel):
     use_remotive: bool = True
     use_web_discovery: bool = True
     max_jobs_to_score: int = 40
+    max_age_days: int = 45  # ignore postings older than this (when the source gives a date); 0 = off
+    scoring_workers: int = 4  # parallel Claude scoring calls
 
 
 class ApplyConfig(BaseModel):
@@ -29,6 +31,11 @@ class ApplyConfig(BaseModel):
     headless: bool = False
     # Truthful answers to questions the resume can't answer. Never guessed by the agent.
     standard_answers: dict[str, str] = Field(default_factory=dict)
+
+    def real_answers(self) -> dict[str, str]:
+        """Drop blank / placeholder values so the agent never 'answers' with a template string."""
+        return {k: v for k, v in self.standard_answers.items()
+                if isinstance(v, str) and v.strip() and not v.strip().upper().startswith(("TODO", "FILL"))}
 
 
 class Settings(BaseModel):

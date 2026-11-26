@@ -38,7 +38,13 @@ export ANTHROPIC_API_KEY=sk-ant-...     # from https://console.anthropic.com
 cp config.example.yaml config.yaml      # then edit locations, companies, standard answers
 ```
 
-Optional: install LibreOffice to also get PDF resumes (`soffice` on PATH); otherwise DOCX is uploaded.
+Then fill in `apply.standard_answers` in `config.yaml` with your real answers. Any value left as `TODO` is
+ignored, and the agent flags those questions for you instead of answering them.
+
+Optional:
+- Install LibreOffice to also get PDF resumes (`soffice` on PATH); otherwise the DOCX is uploaded.
+- `export JOBAGENT_CHROME=/path/to/chrome` to use a Chrome/Chromium you already have instead of
+  Playwright's browser.
 
 ## Usage
 
@@ -56,15 +62,17 @@ python -m jobagent apply --limit 5                            # tailor + fill fo
 python -m jobagent apply --job "greenhouse:stripe/5551234"    # one specific job
 ```
 
-Tailored documents go to `output/<company>-<title>-<id>/` (resume, cover letter, the tailored JSON
-with a change log, and screenshots of the filled form).
+Tailored documents go to `output/<company>-<title>-<id>/`: the resume, cover letter, tailored JSON with a
+change log, `fact_check.json` (claims the fact-checker couldn't verify against your original resume — the
+agent repairs up to twice and warns you if any remain), and screenshots of the filled form.
 
 ### Review mode vs. auto-submit
 
 By default (`auto_submit: false`) the agent fills the form in a visible browser window and pauses.
 You check it, complete anything it flagged, click **Submit** yourself, then type `y` in the terminal.
 With `--auto-submit` (or `auto_submit: true`) it submits on its own **only when every required field
-was answered**; otherwise it still leaves the application for you. Start in review mode until you trust
+on the page is actually filled** (checked in the browser after filling, not just trusted from Claude);
+otherwise it leaves the application as `filled` for you. Start in review mode until you trust
 the answers it gives.
 
 ### Job statuses
@@ -80,7 +88,9 @@ the tailored resume is ready) / `failed`.
 | `search.locations`, `search.remote_ok` | Location filter (empty list = anywhere) |
 | `search.greenhouse_boards`, `search.lever_companies` | Companies you specifically want to watch |
 | `search.use_web_discovery` | Let Claude web-search for more Greenhouse/Lever companies |
-| `search.max_jobs_to_score` | Caps Claude scoring calls per run (cost control) |
+| `search.max_jobs_to_score` | Caps Claude scoring calls per run; jobs are ranked locally first so the most relevant get scored |
+| `search.max_age_days` | Skip postings older than this (default 45) |
+| `search.scoring_workers` | Parallel scoring calls (default 4) |
 | `apply.min_score` | Only apply to jobs scored at least this |
 | `apply.max_applications_per_run` | Daily/run cap |
 | `apply.standard_answers` | Your truthful answers to work authorization, sponsorship, salary, notice period, EEO questions. The agent **only** answers such questions from here and never guesses. |
@@ -94,6 +104,10 @@ the tailored resume is ready) / `failed`.
 - **Only public APIs:** Greenhouse Job Board API, Lever Postings API, Remotive API. The agent does not
   scrape LinkedIn/Indeed (their terms forbid automation, and automated applies there can get your account
   banned). Jobs from Remotive are marked `manual`, with tailored docs ready.
+- **Prompt-injection aware:** job descriptions and form labels are treated as untrusted data in every
+  prompt. Legal attestation / consent checkboxes are left for you unless `standard_answers` says otherwise.
+- **Never clicks "Apply with LinkedIn/Indeed/Google"** or other third-party sign-in flows.
+- **Never re-applies** to a job already marked `applied`, even when asked with `--job`.
 - **CAPTCHAs are not bypassed.** If a form shows one, the job is left as `filled` for you to finish.
 - **Caps** on how many jobs are scored and applied to per run.
 

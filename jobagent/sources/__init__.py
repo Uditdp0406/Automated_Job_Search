@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+from datetime import datetime, timezone
 
 import httpx
 
@@ -30,6 +31,22 @@ def http_get_json(url: str, params: dict | None = None):
         return r.json()
 
 
+def age_days(posted_at: str) -> float | None:
+    """Best-effort age of a posting; None if the date can't be parsed."""
+    if not posted_at:
+        return None
+    try:
+        if posted_at.isdigit():  # Lever: epoch milliseconds
+            dt = datetime.fromtimestamp(int(posted_at) / 1000, tz=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(posted_at.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+
+
 # -------------------------------------------------------------- Greenhouse --
 def fetch_greenhouse(board: str) -> list[JobPosting]:
     """Public Greenhouse Job Board API: https://developers.greenhouse.io/job-board.html"""
@@ -48,7 +65,9 @@ def fetch_greenhouse(board: str) -> list[JobPosting]:
             title=j.get("title", ""),
             location=loc,
             url=j.get("absolute_url", ""),
-            apply_url=j.get("absolute_url", ""),
+            # absolute_url is often the company's own careers page (form in an iframe or elsewhere);
+            # the embed URL is always Greenhouse's own hosted application form.
+            apply_url=f"https://boards.greenhouse.io/embed/job_app?for={board}&token={j['id']}",
             description=html_to_text(j.get("content", "")),
             remote="remote" in loc.lower(),
             posted_at=j.get("updated_at", ""),

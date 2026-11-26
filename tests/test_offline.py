@@ -116,3 +116,136 @@ def test_form_fill_with_browser(tmp_path):
         assert page.eval_on_selector("select", "e => e.options[e.selectedIndex].text") == "India"
         assert page.is_checked("input[value=n]")
         b.close()
+
+
+# ------------------------------------------------------------- regression tests for review fixes --
+def test_greenhouse_apply_url_is_hosted_form(monkeypatch):
+    from jobagent import sources
+    monkeypatch.setattr(sources, "http_get_json", lambda *a, **k: {"jobs": [{
+        "id": 42, "title": "Backend Engineer", "absolute_url": "https://stripe.com/jobs/listing/x?gh_jid=42",
+        "location": {"name": "Remote"}, "content": "&lt;p&gt;Python&lt;/p&gt;", "updated_at": "2026-11-01T00:00:00Z"}]})
+    [j] = sources.fetch_greenhouse("stripe")
+    assert j.apply_url == "https://boards.greenhouse.io/embed/job_app?for=stripe&token=42"
+    assert j.description == "Python" and j.remote and j.can_auto_apply
+
+
+def test_age_filter():
+    from jobagent.sources import age_days
+    assert age_days("2000-01-01T00:00:00Z") > 1000
+    assert age_days("") is None and age_days("garbage") is None
+    assert age_days("1700000000000") > 0  # Lever epoch ms
+    cfg = SearchConfig(max_age_days=30)
+    assert not prefilter(job(posted_at="2020-01-01"), profile(), cfg)[0]
+    assert prefilter(job(posted_at=""), profile(), cfg)[0]
+
+
+def test_standard_answers_placeholders_ignored():
+    from jobagent.config import ApplyConfig
+    a = ApplyConfig(standard_answers={"visa": "TODO Yes / No", "notice": "30 days", "x": "  ", "y": "fill me"})
+    assert a.real_answers() == {"notice": "30 days"}
+
+
+def test_relevance_ranks_better_matches_first():
+    from jobagent.matcher import relevance
+    cfg = SearchConfig()
+    good = job(title="Backend Engineer", description="Python Django PostgreSQL")
+    meh = job(title="Engineer", description="Java")
+    assert relevance(good, profile(), cfg) > relevance(meh, profile(), cfg)
+
+
+def _browser(pw):
+    exe = "/opt/pw-browsers/chromium" if Path("/opt/pw-browsers/chromium").exists() else None
+    try:
+        return pw.chromium.launch(**({"executable_path": exe} if exe else {}))
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(str(e))
+
+
+def test_rescan_clears_stale_keys_and_detects_empty_required():
+    pytest.importorskip("playwright")
+    from playwright.sync_api import sync_playwright
+    from jobagent.applier import EMPTY_REQUIRED_JS, EXTRACT_JS
+    with sync_playwright() as pw:
+        b = _browser(pw); page = b.new_page(); page.set_content(FORM)
+        page.evaluate(EXTRACT_JS)
+        page.eval_on_selector("#name", "e => { e.previousElementSibling.remove(); e.style.display = 'none'; }")
+        fields = page.evaluate(EXTRACT_JS)
+        keys = [f["key"] for f in fields]
+        for k in keys:  # every key must match exactly one element (or one radio group)
+            assert page.locator(f'[data-jobagent-key="{k}"]').count() <= 1
+        email = next(f for f in fields if "Email" in f["label"])
+        assert page.evaluate(EMPTY_REQUIRED_JS, [email["key"]]) == [email["key"]]
+        page.fill(f'[data-jobagent-key="{email["key"]}"]', "a@b.co")
+        assert page.evaluate(EMPTY_REQUIRED_JS, [email["key"]]) == []
+        b.close()
+
+
+COMBO = """<html><body>
+<label id="c-label" for="c">Country *</label>
+<input id="c" role="combobox" aria-labelledby="c-label" required
+  onfocus="document.getElementById('lb').style.display='block'">
+<div id="lb" role="listbox" style="display:none">
+  <div role="option" onclick="c.value='India'">India</div><div role="option" onclick="c.value='Japan'">Japan</div>
+</div>
+<a href="#" id="li">Apply with LinkedIn</a><button id="ap">Apply for this job</button>
+</body></html>"""
+
+
+def test_combobox_options_and_safe_apply_button():
+    pytest.importorskip("playwright")
+    import re
+    from playwright.sync_api import sync_playwright
+    from jobagent.applier import EXTRACT_JS, _collect_combobox_options, _fill
+    with sync_playwright() as pw:
+        b = _browser(pw); page = b.new_page(); page.set_content(COMBO)
+        fields = page.evaluate(EXTRACT_JS)
+        [combo] = [f for f in fields if f["type"] == "combobox"]
+        _collect_combobox_options(page, fields)
+        assert combo["options"] == ["India", "Japan"]
+        assert _fill(page, combo, "India") and page.input_value("#c") == "India"
+        btn = page.locator("a, button").filter(has_text=re.compile(r"^\s*(apply( for this job| now)?)\s*$", re.I))
+        assert btn.count() == 1 and btn.first.get_attribute("id") == "ap"
+        b.close()
+
+
+def test_select_fuzzy_match():
+    pytest.importorskip("playwright")
+    from playwright.sync_api import sync_playwright
+    from jobagent.applier import EXTRACT_JS, _fill
+    with sync_playwright() as pw:
+        b = _browser(pw); page = b.new_page(); page.set_content(FORM)
+        sel = next(f for f in page.evaluate(EXTRACT_JS) if f["type"] == "select")
+        assert _fill(page, sel, "india")            # case-insensitive
+        assert not _fill(page, sel, "Atlantis")     # unknown option -> reported as failed, not guessed
+        b.close()
+
+
+def test_pipeline_score_and_apply_guards(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from jobagent.config import Settings
+    from jobagent.pipeline import Agent
+    s = Settings(data_dir=str(tmp_path / "d"), output_dir=str(tmp_path / "o"))
+    Path(s.data_dir).mkdir(); Path(s.output_dir).mkdir()
+    agent = Agent(s)
+    s.profile_path.write_text(profile().model_dump_json()); s.resume_text_path.write_text("resume")
+    for i, title in enumerate(["Backend Engineer", "Python Developer", "Backend Developer"]):
+        agent.tracker.add(job(source_id=f"acme/{i}", title=title))
+
+    class FakeLLM:
+        def parse(self, *, schema, user, **_):
+            if "Python Developer" in user:
+                raise RuntimeError("boom")
+            score = 90 if "Backend Engineer" in user else 40
+            return FitAssessment(score=score, recommendation="apply" if score > 70 else "skip",
+                                 matched_requirements=[], missing_requirements=[], dealbreakers=[],
+                                 reasoning="", keywords_to_emphasize=[])
+    agent.llm = FakeLLM()
+    assert agent.score() == 3
+    st = {r["key"]: r["status"] for r in agent.tracker.all()}
+    assert st == {"lever:acme/0": "scored", "lever:acme/1": "found", "lever:acme/2": "skipped"}
+
+    agent.tracker.update("lever:acme/0", status="applied")
+    called = []
+    monkeypatch.setattr("jobagent.applier.apply_to_job", lambda *a, **k: called.append(a))
+    agent.apply(keys=["lever:acme/0", "nope"])
+    assert called == []  # never re-applies, unknown keys ignored

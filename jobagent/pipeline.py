@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import sources
 from .config import Settings
 from .llm import LLM
-from .matcher import Matcher, prefilter
+from .matcher import Matcher, prefilter, relevance
 from .models import CandidateProfile, JobPosting
 from .resume import analyze_resume, extract_text
 from .tracker import Tracker
@@ -56,7 +57,8 @@ class Agent:
         for c in sorted(lv):
             found += sources.fetch_lever(c)
         if cfg.use_remotive:
-            for q in (cfg.keywords or profile.search_keywords)[:3] + titles[:2]:
+            # Remotive asks API users to keep request volume low - two searches per run.
+            for q in list(dict.fromkeys(titles[:1] + (cfg.keywords or profile.search_keywords)[:1])):
                 found += sources.fetch_remotive(q)
 
         new, seen = [], set()
@@ -77,19 +79,35 @@ class Agent:
     # -------------------------------------------------------------- score --
     def score(self, limit: int | None = None) -> int:
         profile, _ = self.load_profile()
-        matcher = Matcher(self.llm, profile, self.s.search)
-        rows = self.tracker.by_status("found")[: (limit or self.s.search.max_jobs_to_score)]
-        for row in rows:
-            job = self.tracker.posting(row["key"])
+        cfg = self.s.search
+        matcher = Matcher(self.llm, profile, cfg)
+        jobs = [self.tracker.posting(r["key"]) for r in self.tracker.by_status("found")]
+        # Spend the Claude budget on the most promising postings first.
+        jobs.sort(key=lambda j: relevance(j, profile, cfg), reverse=True)
+        jobs = jobs[: (limit or cfg.max_jobs_to_score)]
+        if not jobs:
+            log.info("nothing to score - run `search` first")
+            return 0
+
+        def one(job: JobPosting):
             try:
-                fit = matcher.assess(job)
-            except Exception as e:  # noqa: BLE001
+                return job, matcher.assess(job)
+            except Exception as e:  # noqa: BLE001 - leave it as 'found' to retry next run
                 log.warning("scoring failed for %s: %s", job.key, e)
+                return job, None
+
+        # First call alone so it writes the prompt cache; the rest run in parallel and read it.
+        results = [one(jobs[0])]
+        with ThreadPoolExecutor(max_workers=max(1, cfg.scoring_workers)) as ex:
+            results += list(ex.map(one, jobs[1:]))
+
+        for job, fit in results:
+            if fit is None:
                 continue
             ok = fit.recommendation != "skip" and not fit.dealbreakers and fit.score >= self.s.apply.min_score
             self.tracker.set_assessment(job.key, fit, "scored" if ok else "skipped")
             log.info("%3d  %-6s %s — %s", fit.score, fit.recommendation, job.company, job.title)
-        return len(rows)
+        return len(jobs)
 
     # ------------------------------------------------------------- tailor --
     def tailor(self, key: str) -> tuple[Path, Path]:
@@ -110,21 +128,35 @@ class Agent:
         cfg = self.s.apply
         auto = cfg.auto_submit if auto_submit is None else auto_submit
         if keys:
-            rows = [self.tracker.get(k) for k in keys if self.tracker.get(k)]
+            rows = []
+            for k in keys:
+                row = self.tracker.get(k)
+                if row is None:
+                    log.warning("unknown job key %r (see `status`)", k)
+                elif row["status"] == "applied":
+                    log.warning("already applied to %s — skipping", k)
+                else:
+                    rows.append(row)
         else:
             rows = self.tracker.by_status("scored", "tailored", min_score=cfg.min_score)
         rows = rows[: (limit or cfg.max_applications_per_run)]
+        answers = cfg.real_answers()
         for row in rows:
             key = row["key"]
             job = self.tracker.posting(key)
-            if not row["resume_path"] or not Path(row["resume_path"]).exists():
-                log.info("tailoring resume for %s — %s", job.company, job.title)
-                resume_path, cover_path = self.tailor(key)
-            else:
-                resume_path, cover_path = Path(row["resume_path"]), Path(row["cover_letter_path"])
-            log.info("applying: %s — %s (%s)", job.company, job.title, job.apply_url or job.url)
-            res = apply_to_job(self.llm, job, profile, resume_path, cover_path, cfg.standard_answers,
-                               auto_submit=auto, headless=cfg.headless, screenshot_dir=resume_path.parent)
+            try:
+                if not row["resume_path"] or not Path(row["resume_path"]).exists():
+                    log.info("tailoring resume for %s — %s", job.company, job.title)
+                    resume_path, cover_path = self.tailor(key)
+                else:
+                    resume_path, cover_path = Path(row["resume_path"]), Path(row["cover_letter_path"])
+                log.info("applying: %s — %s (%s)", job.company, job.title, job.apply_url or job.url)
+                res = apply_to_job(self.llm, job, profile, resume_path, cover_path, answers,
+                                   auto_submit=auto, headless=cfg.headless, screenshot_dir=resume_path.parent)
+            except Exception as e:  # noqa: BLE001 - one bad job must not stop the whole run
+                log.warning("  -> failed: %s", e)
+                self.tracker.update(key, status="failed", notes=str(e)[:500])
+                continue
             self.tracker.update(key, status=res.status, notes=res.notes)
             log.info("  -> %s: %s", res.status, res.notes)
 
