@@ -1,0 +1,35 @@
+# Copy to config.yaml and edit.  (config.yaml is git-ignored because it holds personal answers.)
+model: claude-opus-5-5
+data_dir: data        # profile, resume text, jobs.db
+output_dir: output    # tailored resumes, cover letters, screenshots (one folder per job)
+
+search:
+  titles: []                     # extra titles; Claude also derives titles from your resume
+  keywords: []                   # e.g. ["python", "backend"]; default = resume-derived keywords
+  locations: ["Bengaluru", "India"]   # empty list = anywhere
+  remote_ok: true
+  exclude_keywords: ["security clearance", "unpaid"]
+  exclude_companies: []
+  greenhouse_boards: []          # board tokens, e.g. boards.greenhouse.io/<token>
+  lever_companies: []            # slugs, e.g. jobs.lever.co/<slug>
+  use_remotive: true             # remote jobs (manual apply - external sites)
+  use_web_discovery: true        # Claude web search finds more Greenhouse/Lever companies
+  max_jobs_to_score: 40          # caps Claude calls per run
+
+apply:
+  min_score: 70                  # only apply to jobs Claude scores at least this
+  max_applications_per_run: 10
+  auto_submit: false             # false = agent fills the form, YOU review and click Submit
+  headless: false
+  # Answers the agent may use for legal / eligibility / demographic questions.
+  # It will NEVER guess these - anything missing is left for you to fill in.
+  standard_answers:
+    work_authorization: "Authorized to work in India; would require sponsorship for the US"
+    requires_sponsorship: "Yes, for roles outside India"
+    notice_period: "30 days"
+    expected_salary: "Negotiable"
+    willing_to_relocate: "Yes"
+    how_did_you_hear: "Company careers page"
+    gender: "Prefer not to say"
+    veteran_status: "I am not a protected veteran"
+    disability_status: "I don't wish to answer"
