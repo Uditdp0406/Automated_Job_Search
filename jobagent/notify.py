@@ -20,6 +20,38 @@ from pydantic import BaseModel
 log = logging.getLogger(__name__)
 
 
+# Windows 10/11 toast via built-in PowerShell + WinRT (no extra installs). The XML travels in an
+# environment variable so titles with quotes / emoji can't break the command line.
+_PS_TOAST = r"""
+$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($env:JOBAGENT_TOAST_XML)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show($toast)
+"""
+
+
+def toast_xml(title: str, message: str, url: str = "", urgent: bool = False) -> str:
+    from xml.sax.saxutils import escape, quoteattr
+    launch = f' activationType="protocol" launch={quoteattr(url)}' if url else ""
+    scenario = ' scenario="reminder"' if urgent else ""  # stays on screen until dismissed
+    actions = (f'<actions><action content="Open job" activationType="protocol" arguments={quoteattr(url)}/>'
+               '<action content="Dismiss" activationType="system" arguments="dismiss"/></actions>') if url and urgent else ""
+    return (f'<toast{launch}{scenario}><visual><binding template="ToastGeneric">'
+            f"<text>{escape(title)}</text><text>{escape(message[:400])}</text></binding></visual>"
+            f'<audio src="ms-winsoundevent:Notification.{"Reminder" if urgent else "Default"}"/>{actions}</toast>')
+
+
+def _windows_toast(title: str, message: str, url: str, urgent: bool) -> None:
+    env = dict(os.environ, JOBAGENT_TOAST_XML=toast_xml(title, message, url, urgent))
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", _PS_TOAST],
+                   env=env, check=True, timeout=20, capture_output=True,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
 class EmailConfig(BaseModel):
     smtp_host: str = ""        # e.g. smtp.gmail.com (use an app password)
     smtp_port: int = 587
@@ -67,14 +99,19 @@ class Notifier:
 
     def _desktop(self, title, message, url, urgent):
         system = platform.system()
-        if system == "Linux" and shutil.which("notify-send"):
-            subprocess.run(["notify-send", "-u", "critical" if urgent else "normal", title, message],
-                           check=True, timeout=10)
+        if system == "Windows":
+            _windows_toast(title, message, url, urgent)
         elif system == "Darwin":
             esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')  # noqa: E731
-            subprocess.run(["osascript", "-e", f'display notification "{esc(message)}" with title "{esc(title)}"'],
-                           check=True, timeout=10)
-        # Windows / headless servers: no-op (use ntfy / Telegram for phone alerts)
+            script = f'display notification "{esc(message)}" with title "{esc(title)}"'
+            if urgent:
+                script += ' sound name "Glass"'
+            subprocess.run(["osascript", "-e", script], check=True, timeout=10)
+        elif shutil.which("notify-send"):
+            subprocess.run(["notify-send", "-a", "jobagent", "-u", "critical" if urgent else "normal",
+                            title, message + (f"\n{url}" if url else "")], check=True, timeout=10)
+        else:
+            raise RuntimeError("no desktop notifier found (install libnotify / notify-send)")
 
     def _ntfy(self, title, message, url, urgent):
         # JSON publishing (https://docs.ntfy.sh/publish/#publish-as-json) keeps emoji/UTF-8 intact.

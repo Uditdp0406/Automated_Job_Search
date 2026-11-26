@@ -53,6 +53,7 @@ class WatchConfig(BaseModel):
     min_score: Optional[int] = None     # defaults to apply.min_score
     alert_min_score: Optional[int] = None  # alert (without applying) for matches at least this; default = min_score
     poll_workers: int = 8               # boards polled in parallel
+    keep_awake: bool = True             # stop the laptop idle-sleeping while watching (lid close still sleeps)
 
 
 class Settings(BaseModel):

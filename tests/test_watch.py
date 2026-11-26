@@ -157,23 +157,119 @@ def test_missing_board_is_disabled(env, monkeypatch):
 
 
 def test_watch_loop_runs_and_releases_lock(env):
+    from jobagent.laptop import ProcessLock
     w = env["watcher"]
     sleeps = []
     w.run(max_cycles=2, sleep=sleeps.append)
     assert len(sleeps) == 1 and 1.8 * 60 <= sleeps[0] <= 11.5 * 60
-    assert not (Path(w.s.data_dir) / "watch.lock").exists()
+    lock = ProcessLock(Path(w.s.data_dir) / "watch.lock")
+    lock.acquire(); lock.release()  # released -> can be taken again
     assert env["n"].titles()[0] == "👀 Job watch started"
 
 
 def test_lock_blocks_second_watcher(tmp_path):
-    from jobagent.watcher import AlreadyRunning, WatchLock
-    lock = tmp_path / "watch.lock"
-    lock.write_text(str(os.getppid()))  # a live process that isn't us
+    from jobagent.laptop import AlreadyRunning, ProcessLock
+    first = ProcessLock(tmp_path / "watch.lock")
+    first.acquire()
     with pytest.raises(AlreadyRunning):
-        WatchLock(lock, stale_after_s=3600).acquire()
-    lock.write_text("999999999")         # dead pid -> stale lock is taken over
-    WatchLock(lock, stale_after_s=3600).acquire()
-    assert lock.read_text() == str(os.getpid())
+        ProcessLock(tmp_path / "watch.lock").acquire()
+    first.release()
+    ProcessLock(tmp_path / "watch.lock").acquire()  # a stale lock file alone never blocks
+
+
+def test_lock_is_freed_when_process_dies(tmp_path):
+    import subprocess, sys
+    code = (f"import sys; sys.path.insert(0, {str(Path(__file__).parents[1])!r});"
+            f"from jobagent.laptop import ProcessLock; ProcessLock(__import__('pathlib').Path({str(tmp_path / 'w.lock')!r})).acquire();"
+            "import os; os._exit(9)")  # simulates a crash: no cleanup runs
+    subprocess.run([sys.executable, "-c", code], check=False)
+    from jobagent.laptop import ProcessLock
+    ProcessLock(tmp_path / "w.lock").acquire()
+
+
+def test_offline_cycle_is_quiet_and_retries_soon(env, monkeypatch):
+    import httpx
+    w = env["watcher"]
+    def down(*a, **k):
+        raise httpx.ConnectError("no internet")
+    monkeypatch.setattr(sources, "poll_greenhouse", down)
+    monkeypatch.setattr(sources, "poll_lever", down)
+    sleeps = []
+    w.run(max_cycles=2, sleep=sleeps.append)
+    assert sleeps == [60.0]                                  # quick retry, not the full interval
+    titles = env["n"].titles()
+    assert not any("error" in t.lower() for t in titles)     # no error alerts for being offline
+    assert all(b["last_error"] is None and not b["disabled"] for b in env["agent"].tracker.boards())
+    assert env["agent"].tracker.meta_get("last_check") is None
+
+
+def test_catch_up_after_laptop_was_off(env):
+    w, t = env["watcher"], env["agent"].tracker
+    w.cycle()
+    t.meta_set("last_check", (NOW - timedelta(hours=14)).isoformat(timespec="seconds"))
+    env["boards"][("greenhouse", "acme")].append(posting("acme", 11, "Backend Engineer", days_old=0))
+    w.run(max_cycles=1, sleep=lambda s: None)
+    titles = env["n"].sent
+    started = titles[0]
+    assert started == "👀 Job watch started"
+    assert [k for k, _ in env["applied"]] == ["greenhouse:acme/11"]  # posted while the laptop was off
+
+
+def test_wait_detects_wake_from_sleep():
+    from jobagent.laptop import wait
+    t = [1000.0]
+    calls = []
+    def clock():
+        return t[0]
+    def sleep(sec):
+        calls.append(sec)
+        t[0] += sec + (3600 if len(calls) == 2 else 0)  # laptop suspended for an hour during the 2nd step
+    assert wait(600, step=15, clock=clock, sleep=sleep) is True
+    assert len(calls) == 2                                   # returned right after waking, not 600s later
+    t[0], calls[:] = 0.0, []
+    def normal(sec):
+        calls.append(sec); t[0] += sec
+    assert wait(100, step=15, clock=clock, sleep=normal) is False and sum(calls) == pytest.approx(100)
+
+
+def test_dotenv(tmp_path, monkeypatch):
+    from jobagent.laptop import load_dotenv
+    (tmp_path / ".env").write_text('# keys\nANTHROPIC_API_KEY="sk-test"\nexport NTFY_TOKEN=abc\nALREADY=new\n')
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False); monkeypatch.delenv("NTFY_TOKEN", raising=False)
+    monkeypatch.setenv("ALREADY", "old")
+    assert sorted(load_dotenv(tmp_path / ".env")) == ["ANTHROPIC_API_KEY", "NTFY_TOKEN"]
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-test" and os.environ["ALREADY"] == "old"
+
+
+def test_windows_toast(monkeypatch):
+    import xml.dom.minidom
+    from jobagent import notify
+    from jobagent.notify import Notifier, NotifyConfig
+    ran = []
+    monkeypatch.setattr(notify.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(notify.subprocess, "run", lambda cmd, **kw: ran.append((cmd, kw)))
+    n = Notifier(NotifyConfig(console=False, desktop=True))
+    assert n.send('🎯 New match 90/100 · R&D "Co"', "Matched: <Python>", url="https://x/1?a=1&b=2", urgent=True) == {"desktop": True}
+    cmd, kw = ran[0]
+    assert cmd[0] == "powershell" and "ToastNotificationManager" in cmd[-1]
+    doc = xml.dom.minidom.parseString(kw["env"]["JOBAGENT_TOAST_XML"])  # well-formed despite & < " and emoji
+    toast = doc.documentElement
+    assert toast.getAttribute("launch") == "https://x/1?a=1&b=2" and toast.getAttribute("scenario") == "reminder"
+
+
+def test_pending_walkthrough(env, monkeypatch, capsys):
+    from jobagent.cli import _pending
+    t = env["agent"].tracker
+    t.add(posting("acme", 21, "Backend Engineer")); t.update("greenhouse:acme/21", status="filled", score=88)
+    t.add(posting("remo", 22, "Backend Engineer", source="remotive"))
+    t.update("remotive:remo/22", status="manual", score=80, resume_path="r.pdf")
+    applied_keys, opened = [], []
+    monkeypatch.setattr(env["agent"], "apply", lambda keys, auto_submit: applied_keys.append((keys, auto_submit)))
+    answers = iter(["", "y"])
+    _pending(env["agent"], ask=lambda _: next(answers), open_url=opened.append)
+    assert applied_keys == [(["greenhouse:acme/21"], False)]   # reopened in review mode, never auto-submitted
+    assert env["agent"].s.apply.headless is False
+    assert opened == ["https://x/remo/22"] and t.get("remotive:remo/22")["status"] == "applied"
 
 
 # ------------------------------------------------------------------------------ alert channels --

@@ -28,23 +28,41 @@ resume.pdf ─► analyze ─► profile.json
                                        browser form fill ─► you review ─► submitted ✔
 ```
 
-## Setup
+## Setup (on your laptop)
 
-```bash
-python -m venv .venv && source .venv/bin/activate
+**Windows (PowerShell):**
+```powershell
+py -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-playwright install chromium            # browser used to fill application forms
-export ANTHROPIC_API_KEY=sk-ant-...     # from https://console.anthropic.com
-cp config.example.yaml config.yaml      # then edit locations, companies, standard answers
+playwright install chromium
+copy config.example.yaml config.yaml
 ```
 
-Then fill in `apply.standard_answers` in `config.yaml` with your real answers. Any value left as `TODO` is
-ignored, and the agent flags those questions for you instead of answering them.
+**macOS / Linux:**
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+playwright install chromium
+cp config.example.yaml config.yaml
+```
 
-Optional:
-- Install LibreOffice to also get PDF resumes (`soffice` on PATH); otherwise the DOCX is uploaded.
-- `export JOBAGENT_CHROME=/path/to/chrome` to use a Chrome/Chromium you already have instead of
-  Playwright's browser.
+Then create a file named `.env` in the project folder (it's git-ignored), so you don't have to set keys
+in every new terminal:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...        # from https://console.anthropic.com
+# optional alert channels:
+# TELEGRAM_BOT_TOKEN=...
+# TELEGRAM_CHAT_ID=...
+```
+
+Edit `config.yaml`: add the companies you want to watch, and fill in `apply.standard_answers` with your
+real answers. Any value left as `TODO` is ignored, and the agent flags those questions for you instead
+of answering them.
+
+Optional: install LibreOffice to also get PDF resumes (otherwise the DOCX is uploaded), and set
+`JOBAGENT_CHROME` to use a Chrome you already have instead of Playwright's browser.
 
 ## Usage
 
@@ -61,6 +79,7 @@ python -m jobagent tailor "lever:acme/1234-abcd"              # tailored resume 
 python -m jobagent apply --limit 5                            # tailor + fill forms for top jobs
 python -m jobagent apply --job "greenhouse:stripe/5551234"    # one specific job
 python -m jobagent watch                                      # alert + apply the moment new jobs open
+python -m jobagent pending                                    # finish the applications that need you
 ```
 
 Tailored documents go to `output/<company>-<title>-<id>/`: the resume, cover letter, tailored JSON with a
@@ -125,22 +144,29 @@ Details:
 | Email | `notify.email.*` + env `SMTP_PASSWORD` (Gmail: use an app password) |
 | Desktop / console | On by default (Linux `notify-send`, macOS notifications) |
 
-### Keeping it running 24/7
+### Running it on your laptop
 
-The watcher has to run on a machine that stays on (your PC while it's awake, or a small always-on
-server or VPS). It needs a desktop or `xvfb` only if you want to watch the browser; submissions run headless.
+Start it whenever you like and leave the terminal window open:
 
 ```bash
-# simplest: in the background
-nohup python -m jobagent watch >> watch.log 2>&1 &
-
-# or cron: one check every 10 minutes (the state lives in data/jobs.db, the lock prevents overlaps)
-*/10 * * * * cd /path/to/Automated_Job_Search && .venv/bin/python -m jobagent watch --once >> watch.log 2>&1
+python -m jobagent watch          # Ctrl+C to stop
 ```
 
-Windows: in Task Scheduler, create a task that runs every 10 minutes with the program
-`C:\path\to\.venv\Scripts\python.exe`, the arguments `-m jobagent watch --once`, and the start-in folder
-set to the project.
+- **Desktop alerts.** These are Windows notifications (click one to open the job), macOS Notification
+  Centre (with a sound for matches) or Linux notifications. Add ntfy or Telegram if you also want alerts
+  on your phone when you're away from the laptop.
+- **Your laptop stays awake while watching** (`watch.keep_awake`). Closing the lid still puts it to
+  sleep. That's fine: when it wakes, the next check runs within ~15 seconds.
+- **Nothing is missed while it was off.** The agent remembers every posting it has seen. When you start
+  it again, anything that opened in the meantime (hours or days ago) is treated as new: scored, alerted
+  and applied to, within the daily cap. The start alert tells you how long it was off.
+- **No internet** (on a train, or just after waking up): it waits quietly and retries every minute, with
+  no error alerts.
+- **When you're back at the laptop:** `python -m jobagent pending` walks you through everything waiting
+  for you. Half-filled forms open pre-filled in a visible browser for you to finish and submit.
+  Manual-apply jobs open in your browser, with the tailored resume path shown.
+- **Only one watcher at a time.** Opening a second window tells you it's already running. If the laptop
+  crashes, the lock frees itself.
 
 ## Configuration highlights (`config.yaml`)
 
@@ -209,6 +235,7 @@ jobagent/
   matcher.py    prefilter + Claude fit scoring
   tailor.py     tailored resume, fact-check, cover letter, DOCX/PDF rendering
   applier.py    Playwright form discovery + Claude form answering + submit
+  laptop.py     laptop helpers: crash-safe lock, keep-awake, wake detection, .env loading
   watcher.py    watch mode: polling, baseline, alert -> tailor -> apply on new postings
   notify.py     alert channels (ntfy, Telegram, Slack/Discord, email, desktop, console)
   tracker.py    SQLite job tracker (+ watch list, seen postings)

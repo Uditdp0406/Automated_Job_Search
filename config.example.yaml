@@ -49,11 +49,12 @@ watch:
   max_applications_per_day: 15    # rolling 24h cap (also respected by `apply`)
   min_score: 75                   # apply threshold while watching (default: apply.min_score)
   alert_min_score: 65             # also alert (without applying) for decent-but-not-great matches
+  keep_awake: true                # stop the laptop idle-sleeping while watching (closing the lid still sleeps)
 
 # Where alerts go. Every enabled channel gets every alert. Secrets come from environment variables.
 notify:
   console: true
-  desktop: true                   # Linux notify-send / macOS notification centre
+  desktop: true                   # Windows notifications / macOS Notification Centre / Linux notify-send
   ntfy_topic: ""                  # easiest phone push: install the free "ntfy" app, subscribe to a long random
                                   # topic name (anyone who knows the name can read it) and put it here
   telegram: false                 # needs env TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID

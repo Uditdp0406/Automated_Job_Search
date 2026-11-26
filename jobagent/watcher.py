@@ -20,13 +20,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import sources
+import httpx
+
+from . import laptop, sources
+from .laptop import AlreadyRunning, ProcessLock  # noqa: F401 - re-exported for the CLI
 from .matcher import Matcher, prefilter
 from .models import JobPosting
 from .notify import Notifier
 
 log = logging.getLogger(__name__)
 MIN_INTERVAL_MIN = 2.0
+OFFLINE_RETRY_S = 60.0
 
 
 def _now() -> datetime:
@@ -35,49 +39,6 @@ def _now() -> datetime:
 
 def _iso(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds")
-
-
-class AlreadyRunning(RuntimeError):
-    pass
-
-
-class WatchLock:
-    """Lock file so cron / Task Scheduler / a second terminal can't run two watchers at once."""
-
-    def __init__(self, path: Path, stale_after_s: float):
-        self.path, self.stale_after_s = path, stale_after_s
-
-    def _alive(self, pid: int) -> bool:
-        if os.name != "posix":
-            return True  # rely on staleness by age on Windows
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-
-    def acquire(self) -> None:
-        if self.path.exists():
-            try:
-                pid = int(self.path.read_text().strip() or 0)
-            except ValueError:
-                pid = 0
-            age = time.time() - self.path.stat().st_mtime
-            if pid and pid != os.getpid() and self._alive(pid) and age < self.stale_after_s:
-                raise AlreadyRunning(f"another watcher (pid {pid}) is running; lock: {self.path}")
-        self.path.write_text(str(os.getpid()))
-
-    def touch(self) -> None:
-        self.path.write_text(str(os.getpid()))
-
-    def release(self) -> None:
-        try:
-            if self.path.read_text().strip() == str(os.getpid()):
-                self.path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 @dataclass
@@ -89,6 +50,7 @@ class CycleStats:
     matches: list[str] = field(default_factory=list)
     applied: list[str] = field(default_factory=list)
     needs_you: list[str] = field(default_factory=list)
+    offline: bool = False
 
 
 class Watcher:
@@ -149,6 +111,11 @@ class Watcher:
         with ThreadPoolExecutor(max_workers=max(1, self.cfg.poll_workers)) as ex:
             results = list(ex.map(lambda b: self._poll(b["source"], b["slug"]), boards))
         baselined = {(b["source"], b["slug"]): b["baselined_at"] for b in boards}
+        if results and all(isinstance(err, (httpx.TransportError, OSError)) for _, _, _, err in results):
+            # Every board failed to connect: the laptop is offline (or just woke up). Not the boards' fault.
+            stats.offline = True
+            stats.boards_polled = len(results)
+            return []
 
         batches: list[tuple[list[JobPosting], bool, str, str]] = []
         for source, slug, jobs, err in results:
@@ -245,7 +212,7 @@ class Watcher:
         if self._applied_last_24h() >= self.cfg.max_applications_per_day:
             self.notifier.send("⏸ Daily application cap reached",
                                f"{headline}\nNot applied (cap {self.cfg.max_applications_per_day}/24h). "
-                               f"Run later:  jobagent apply --job \"{job.key}\"", url=job.url)
+                               "It stays in the queue: python -m jobagent apply", url=job.url)
             return
         try:
             resume_path, cover_path = self.agent.tailor(job.key)
@@ -262,7 +229,7 @@ class Watcher:
             return
         if not self.cfg.auto_submit:
             self.notifier.send("📝 Application ready for your review",
-                               f"{headline}\nResume: {resume_path}\nRun:  jobagent apply --job \"{job.key}\"",
+                               f"{headline}\nResume: {resume_path}\nReview + submit:  python -m jobagent pending",
                                url=job.url, urgent=True)
             stats.needs_you.append(headline)
             return
@@ -276,7 +243,7 @@ class Watcher:
         elif res.status == "filled":
             stats.needs_you.append(headline)
             self.notifier.send("⚠️ Almost applied - needs you", f"{headline}\n{res.notes[-300:]}\n"
-                               f"Finish:  jobagent apply --job \"{job.key}\"", url=job.apply_url or job.url,
+                               "Finish it:  python -m jobagent pending", url=job.apply_url or job.url,
                                urgent=True)
         else:
             self.notifier.send(f"❌ Application {res.status}", f"{headline}\n{res.notes[:300]}",
@@ -289,6 +256,8 @@ class Watcher:
         self.sync_boards()
         self.maybe_discover(profile)
         new = self._collect_new(profile, stats)
+        if stats.offline:
+            return stats
         relevant = self._relevant(new, profile)
         # Retry jobs whose scoring failed in an earlier cycle.
         pending = [self.tracker.posting(r["key"]) for r in self.tracker.by_status("found")
@@ -326,43 +295,71 @@ class Watcher:
         return stats
 
     # ---------------------------------------------------------------------- loop --
-    def run(self, once: bool = False, max_cycles: int | None = None, sleep=time.sleep) -> None:
+    @staticmethod
+    def _ago(iso: str) -> str:
+        mins = (_now() - datetime.fromisoformat(iso)).total_seconds() / 60
+        return f"{mins:.0f} min" if mins < 90 else (f"{mins / 60:.1f} h" if mins < 48 * 60 else f"{mins / 1440:.1f} days")
+
+    def run(self, once: bool = False, max_cycles: int | None = None, sleep=None) -> None:
+        """Watch until Ctrl+C. `sleep(seconds)` is injectable for tests; default handles laptop sleep/wake."""
         interval = max(MIN_INTERVAL_MIN, self.cfg.interval_minutes) * 60
-        lock = WatchLock(Path(self.s.data_dir) / "watch.lock", stale_after_s=max(3 * interval, 3600))
+        waiter = sleep or laptop.wait
+        lock = ProcessLock(Path(self.s.data_dir) / "watch.lock")
         lock.acquire()
-        self.sync_boards()
-        n_boards = len(self.tracker.boards())
-        if not once:
-            self.notifier.send("👀 Job watch started",
-                               f"Watching {n_boards} companies every {interval / 60:g} min. "
-                               f"Auto-apply: {'on' if self.cfg.auto_apply and self.cfg.auto_submit else 'review mode'}"
-                               f", min score {self.min_score}, max {self.cfg.max_applications_per_day}/day.")
-        if n_boards == 0 and not self.s.search.use_web_discovery:
-            log.warning("watch list is empty: add search.greenhouse_boards / lever_companies or enable discovery")
-        cycles = 0
         try:
-            while True:
-                cycles += 1
-                lock.touch()
-                started = time.monotonic()
-                try:
-                    st = self.cycle()
-                    log.info("check #%d: %d boards (%d errors), %d new postings, %d relevant, %d matches, "
-                             "%d applied, %d need you", cycles, st.boards_polled, st.board_errors, st.new_postings,
-                             st.relevant, len(st.matches), len(st.applied), len(st.needs_you))
-                except SystemExit:
-                    raise
-                except Exception as e:  # noqa: BLE001 - keep watching; alert at most hourly
-                    log.exception("watch cycle failed")
-                    if self._due("last_error_alert", 1):
-                        self.notifier.send("❌ Job watch error", str(e)[:400], urgent=True)
-                        self.tracker.meta_set("last_error_alert", _iso(_now()))
-                if once or (max_cycles and cycles >= max_cycles):
-                    break
-                wait = max(0.0, interval * random.uniform(0.9, 1.1) - (time.monotonic() - started))
-                log.info("next check in %.1f min (Ctrl+C to stop)", wait / 60)
-                sleep(wait)
+            with laptop.KeepAwake(self.cfg.keep_awake and not once):
+                self._loop(once, max_cycles, interval, waiter)
         except KeyboardInterrupt:
             log.info("watch stopped")
         finally:
             lock.release()
+
+    def _loop(self, once, max_cycles, interval, waiter) -> None:
+        self.sync_boards()
+        n_boards = len(self.tracker.boards())
+        last = self.tracker.meta_get("last_check")
+        catch_up = ""
+        if last and (_now() - datetime.fromisoformat(last)).total_seconds() > 2 * interval:
+            catch_up = f"\nLast check was {self._ago(last)} ago - catching up on jobs posted since then."
+        if not once:
+            self.notifier.send("👀 Job watch started",
+                               f"Watching {n_boards} companies every {interval / 60:g} min. "
+                               f"Auto-apply: {'on' if self.cfg.auto_apply and self.cfg.auto_submit else 'review mode'}"
+                               f", min score {self.min_score}, max {self.cfg.max_applications_per_day}/day."
+                               + catch_up)
+        elif catch_up:
+            log.info(catch_up.strip())
+        if n_boards == 0 and not self.s.search.use_web_discovery:
+            log.warning("watch list is empty: add companies with `jobagent boards --add ...` or enable discovery")
+        cycles = 0
+        while True:
+            cycles += 1
+            started = time.monotonic()
+            offline = False
+            try:
+                st = self.cycle()
+                offline = st.offline
+                if offline:
+                    log.info("no internet connection - will retry in %.0f s", OFFLINE_RETRY_S)
+                else:
+                    self.tracker.meta_set("last_check", _iso(_now()))
+                    log.info("check #%d: %d boards (%d errors), %d new postings, %d relevant, %d matches, "
+                             "%d applied, %d need you", cycles, st.boards_polled, st.board_errors, st.new_postings,
+                             st.relevant, len(st.matches), len(st.applied), len(st.needs_you))
+                    if st.needs_you:
+                        log.info("run `python -m jobagent pending` to finish the ones that need you")
+            except SystemExit:
+                raise
+            except Exception as e:  # noqa: BLE001 - keep watching; alert at most hourly
+                log.exception("watch cycle failed")
+                if self._due("last_error_alert", 1):
+                    self.notifier.send("❌ Job watch error", str(e)[:400], urgent=True)
+                    self.tracker.meta_set("last_error_alert", _iso(_now()))
+            if once or (max_cycles and cycles >= max_cycles):
+                break
+            if offline:
+                wait = OFFLINE_RETRY_S
+            else:
+                wait = max(0.0, interval * random.uniform(0.9, 1.1) - (time.monotonic() - started))
+                log.info("next check in %.1f min (Ctrl+C to stop)", wait / 60)
+            waiter(wait)

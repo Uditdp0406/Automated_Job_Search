@@ -56,6 +56,41 @@ def _edit_boards(agent, add: list[str], remove: list[str]) -> None:
         print(f"{r['source']:<11} {r['slug']:<24} {r['origin'] or '':<11} {r['last_polled_at'] or '-':<26} {note}")
 
 
+def _pending(agent, ask=input, open_url=None) -> None:
+    """Go through everything waiting for you: half-filled forms, docs ready for review, manual-apply sites."""
+    import webbrowser
+    open_url = open_url or webbrowser.open
+    t = agent.tracker
+    rows = t.by_status("filled", "tailored", "manual")
+    if not rows:
+        print("Nothing is waiting for you.")
+        return
+    print(f"{len(rows)} application(s) need you:\n")
+    agent.s.apply.headless = False  # you're at the laptop: show the browser
+    for i, r in enumerate(rows, 1):
+        job = t.posting(r["key"])
+        print(f"[{i}/{len(rows)}] {r['score'] or '?'}/100  {job.company} — {job.title}  ({r['status']})")
+        if r["notes"]:
+            print(f"    note: {r['notes'][-200:]}")
+        if job.can_auto_apply:
+            choice = ask("    Enter = open it in the browser (pre-filled), s = skip, q = quit: ").strip().lower()
+            if choice == "q":
+                break
+            if choice != "s":
+                agent.apply(keys=[r["key"]], auto_submit=False)
+            continue
+        print(f"    apply at : {job.apply_url or job.url}")
+        print(f"    resume   : {r['resume_path'] or '-'}\n    cover    : {r['cover_letter_path'] or '-'}")
+        open_url(job.apply_url or job.url)
+        choice = ask("    Type y once you've applied, s = skip, q = quit: ").strip().lower()
+        if choice == "q":
+            break
+        if choice == "y":
+            t.update(r["key"], status="applied", notes="applied manually")
+    print()
+    _print_status(t)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="jobagent", description="AI job search agent powered by Claude")
     ap.add_argument("-c", "--config", default="config.yaml", help="config file (default: config.yaml)")
@@ -78,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--auto-submit", action="store_true")
     sub.add_parser("status", help="show tracked jobs")
     w = sub.add_parser("watch", help="keep checking for newly opened jobs; alert + apply immediately")
-    w.add_argument("--once", action="store_true", help="one check then exit (for cron / Task Scheduler)")
+    w.add_argument("--once", action="store_true", help="do one check and exit")
     w.add_argument("--interval", type=float, help="minutes between checks (overrides config)")
     w.add_argument("--review", action="store_true", help="don't submit; prepare docs and alert you instead")
     b = sub.add_parser("boards", help="show / edit the companies being watched")
@@ -86,7 +121,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="e.g. greenhouse:stripe or lever:netflix (repeatable)")
     b.add_argument("--remove", action="append", default=[], metavar="SOURCE:SLUG")
     sub.add_parser("notify-test", help="send a test alert to every configured channel")
+    sub.add_parser("pending", help="finish applications that need you (opens each one for review)")
 
+    from .laptop import fix_console_encoding, load_dotenv
+    fix_console_encoding()
+    load_dotenv(".env")  # ANTHROPIC_API_KEY etc. without exporting them in every terminal
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
@@ -129,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         elif args.cmd == "boards":
             _edit_boards(agent, args.add, args.remove)
+        elif args.cmd == "pending":
+            _pending(agent)
         elif args.cmd == "notify-test":
             from .notify import Notifier
             n = Notifier(agent.s.notify)
