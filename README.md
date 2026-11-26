@@ -80,6 +80,7 @@ python -m jobagent apply --limit 5                            # tailor + fill fo
 python -m jobagent apply --job "greenhouse:stripe/5551234"    # one specific job
 python -m jobagent watch                                      # alert + apply the moment new jobs open
 python -m jobagent pending                                    # finish the applications that need you
+python -m jobagent schedule install                           # run checks automatically (cron / Task Scheduler)
 ```
 
 Tailored documents go to `output/<company>-<title>-<id>/`: the resume, cover letter, tailored JSON with a
@@ -168,6 +169,36 @@ python -m jobagent watch          # Ctrl+C to stop
 - **Only one watcher at a time.** Opening a second window tells you it's already running. If the laptop
   crashes, the lock frees itself.
 
+### Run it automatically (one command)
+
+Instead of keeping a terminal open, let your laptop's scheduler run a check every few minutes:
+
+```bash
+python -m jobagent schedule install              # every watch.interval_minutes (default 10)
+python -m jobagent schedule install --every 5    # or pick the interval
+python -m jobagent schedule status               # is it installed, last check, applied today, log tail
+python -m jobagent schedule remove               # stop it
+```
+
+| Your laptop | What gets set up |
+|---|---|
+| **Windows** | A Task Scheduler task `jobagent-watch`. It runs on battery, runs a missed check after sleep, never opens a console window, and is visible in Task Scheduler. |
+| **macOS** | A launchd agent `~/Library/LaunchAgents/com.jobagent.watch.plist`, macOS's built-in replacement for cron. Missed checks run after wake. Use `--method cron` for a crontab entry instead. |
+| **Linux** | One line in your crontab, tagged `# jobagent-watch` (your other cron jobs are left alone). |
+
+Every scheduled run does one check (`watch --once`): new postings → alert → tailor → apply.
+- **Runs never overlap.** If the previous run is still applying, the next one skips quietly.
+- **Everything is logged** to `data/watch.log`, rotated so it stays small.
+- **Alerts still pop up** on your desktop.
+- **It only runs while the laptop is on and you're logged in.** It catches up on anything posted while it
+  was off.
+
+Run `schedule install` from the project folder after `analyze`. Put `ANTHROPIC_API_KEY` in `.env`:
+scheduled runs don't see variables set in your terminal.
+
+**macOS note:** if the project is inside Documents/Desktop/Downloads, macOS may block background access.
+Move it to e.g. `~/jobagent`, or allow Python under System Settings → Privacy & Security.
+
 ## Configuration highlights (`config.yaml`)
 
 | Key | What it does |
@@ -235,6 +266,7 @@ jobagent/
   matcher.py    prefilter + Claude fit scoring
   tailor.py     tailored resume, fact-check, cover letter, DOCX/PDF rendering
   applier.py    Playwright form discovery + Claude form answering + submit
+  schedule.py   `schedule install/remove/status`: Task Scheduler / launchd / cron
   laptop.py     laptop helpers: crash-safe lock, keep-awake, wake detection, .env loading
   watcher.py    watch mode: polling, baseline, alert -> tailor -> apply on new postings
   notify.py     alert channels (ntfy, Telegram, Slack/Discord, email, desktop, console)

@@ -335,6 +335,7 @@ class Watcher:
         while True:
             cycles += 1
             started = time.monotonic()
+            self.tracker.meta_set("last_run", _iso(_now()))
             offline = False
             try:
                 st = self.cycle()
