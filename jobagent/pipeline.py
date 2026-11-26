@@ -141,7 +141,12 @@ class Agent:
             rows = self.tracker.by_status("scored", "tailored", min_score=cfg.min_score)
         rows = rows[: (limit or cfg.max_applications_per_run)]
         answers = cfg.real_answers()
+        from datetime import datetime, timedelta, timezone
+        day_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
         for row in rows:
+            if self.tracker.applied_since(day_ago) >= self.s.watch.max_applications_per_day:
+                log.warning("daily cap of %d applications reached - stopping", self.s.watch.max_applications_per_day)
+                break
             key = row["key"]
             job = self.tracker.posting(key)
             try:

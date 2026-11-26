@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 from pydantic import BaseModel, Field
+
+from .notify import NotifyConfig
 
 
 class SearchConfig(BaseModel):
@@ -38,12 +40,29 @@ class ApplyConfig(BaseModel):
                 if isinstance(v, str) and v.strip() and not v.strip().upper().startswith(("TODO", "FILL"))}
 
 
+class WatchConfig(BaseModel):
+    """`jobagent watch`: poll boards continuously, alert on new matches, apply immediately."""
+    interval_minutes: float = 10        # how often to check watched company boards (min 2)
+    discovery_every_hours: float = 12   # Claude web search for new companies to watch; 0 = off
+    remotive_every_hours: float = 6     # Remotive is polled rarely (their API asks for low volume); 0 = off
+    include_existing_on_first_run: bool = False  # False: jobs already open when watching starts are ignored...
+    fresh_hours: float = 24             # ...except ones posted within this many hours (when the date is known)
+    auto_apply: bool = True             # tailor + apply the moment a match appears
+    auto_submit: bool = True            # False: prepare docs + alert you; you run `apply --job KEY`
+    max_applications_per_day: int = 15  # rolling 24h cap, across watch and manual applies
+    min_score: Optional[int] = None     # defaults to apply.min_score
+    alert_min_score: Optional[int] = None  # alert (without applying) for matches at least this; default = min_score
+    poll_workers: int = 8               # boards polled in parallel
+
+
 class Settings(BaseModel):
     model: str = "claude-opus-5-5"
     data_dir: str = "data"
     output_dir: str = "output"
     search: SearchConfig = Field(default_factory=SearchConfig)
     apply: ApplyConfig = Field(default_factory=ApplyConfig)
+    watch: WatchConfig = Field(default_factory=WatchConfig)
+    notify: NotifyConfig = Field(default_factory=NotifyConfig)
 
     @property
     def db_path(self) -> Path:

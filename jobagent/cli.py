@@ -30,6 +30,32 @@ def _print_status(tracker) -> None:
         print(f"{score:>5}  {r['status']:<9} {(r['company'] or '')[:22]:<22} {(r['title'] or '')[:45]:<45} {r['key']}")
 
 
+def _edit_boards(agent, add: list[str], remove: list[str]) -> None:
+    t = agent.tracker
+    for spec in add + remove:
+        if ":" not in spec or spec.split(":", 1)[0] not in ("greenhouse", "lever"):
+            raise SystemExit(f"bad board {spec!r}: use greenhouse:<token> or lever:<slug>")
+    for spec in add:
+        src, slug = spec.split(":", 1)
+        t.add_board(src, slug, "manual")
+        t.board_update(src, slug.lower(), disabled=0)
+    for spec in remove:
+        src, slug = spec.split(":", 1)
+        t.board_update(src, slug.lower(), disabled=1)
+    for b in agent.s.search.greenhouse_boards:
+        t.add_board("greenhouse", b, "config")
+    for c in agent.s.search.lever_companies:
+        t.add_board("lever", c, "config")
+    rows = t.boards(include_disabled=True)
+    if not rows:
+        print("Watch list is empty. Add companies:  jobagent boards --add greenhouse:stripe --add lever:netflix")
+        return
+    print(f"{'SOURCE':<11} {'COMPANY':<24} {'ORIGIN':<11} {'LAST CHECKED':<26} NOTE")
+    for r in rows:
+        note = "disabled" if r["disabled"] else (r["last_error"] or ("" if r["baselined_at"] else "not checked yet"))
+        print(f"{r['source']:<11} {r['slug']:<24} {r['origin'] or '':<11} {r['last_polled_at'] or '-':<26} {note}")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="jobagent", description="AI job search agent powered by Claude")
     ap.add_argument("-c", "--config", default="config.yaml", help="config file (default: config.yaml)")
@@ -51,6 +77,15 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--resume", help="resume file (omit to reuse the last analyzed one)")
     r.add_argument("--auto-submit", action="store_true")
     sub.add_parser("status", help="show tracked jobs")
+    w = sub.add_parser("watch", help="keep checking for newly opened jobs; alert + apply immediately")
+    w.add_argument("--once", action="store_true", help="one check then exit (for cron / Task Scheduler)")
+    w.add_argument("--interval", type=float, help="minutes between checks (overrides config)")
+    w.add_argument("--review", action="store_true", help="don't submit; prepare docs and alert you instead")
+    b = sub.add_parser("boards", help="show / edit the companies being watched")
+    b.add_argument("--add", action="append", default=[], metavar="SOURCE:SLUG",
+                   help="e.g. greenhouse:stripe or lever:netflix (repeatable)")
+    b.add_argument("--remove", action="append", default=[], metavar="SOURCE:SLUG")
+    sub.add_parser("notify-test", help="send a test alert to every configured channel")
 
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -81,6 +116,28 @@ def main(argv: list[str] | None = None) -> int:
             _print_status(agent.tracker)
         elif args.cmd == "status":
             _print_status(agent.tracker)
+        elif args.cmd == "watch":
+            from .watcher import AlreadyRunning, Watcher
+            if args.interval:
+                agent.s.watch.interval_minutes = args.interval
+            if args.review:
+                agent.s.watch.auto_submit = False
+            try:
+                Watcher(agent).run(once=args.once)
+            except AlreadyRunning as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 1
+        elif args.cmd == "boards":
+            _edit_boards(agent, args.add, args.remove)
+        elif args.cmd == "notify-test":
+            from .notify import Notifier
+            n = Notifier(agent.s.notify)
+            res = n.send("🔔 jobagent test alert", "If you can read this, job alerts will reach you here.",
+                         url="https://github.com", urgent=False)
+            for ch, ok in res.items():
+                print(f"  {ch:<9} {'ok' if ok else 'FAILED (see warning above)'}")
+            if not res:
+                print("No channels enabled - see the notify: section of config.example.yaml")
     except LLMError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

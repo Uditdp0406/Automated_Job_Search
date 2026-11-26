@@ -215,7 +215,7 @@ def _looks_submitted(page) -> bool:
 
 def apply_to_job(llm: LLM, job: JobPosting, profile: CandidateProfile, resume_path: Path, cover_path: Path,
                  standard_answers: dict, auto_submit: bool = False, headless: bool = False,
-                 screenshot_dir: Path | None = None) -> ApplyResult:
+                 screenshot_dir: Path | None = None, interactive: bool = True) -> ApplyResult:
     if not job.can_auto_apply:
         return ApplyResult("manual", f"Apply manually at {job.apply_url or job.url}")
 
@@ -285,8 +285,8 @@ def apply_to_job(llm: LLM, job: JobPosting, profile: CandidateProfile, resume_pa
                 return ApplyResult("filled", notes + "; clicked submit but no confirmation seen "
                                    "(CAPTCHA or validation error?) - check the screenshot")
 
-            if headless:
-                return ApplyResult("filled", notes + "; headless review mode - not submitted")
+            if headless or not interactive:
+                return ApplyResult("filled", notes + "; not submitted - needs your review")
             # Human-in-the-loop: you review in the open browser, fix anything, and click Submit yourself.
             print(f"\n=== {job.company} — {job.title}")
             print(f"    Filled {len(filled)} fields. Required fields still empty: {missing_required or 'none'}")

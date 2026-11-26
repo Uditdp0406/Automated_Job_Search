@@ -36,3 +36,30 @@ apply:
     gender: "TODO or 'Prefer not to say'"
     veteran_status: "TODO"
     disability_status: "TODO"
+
+# `python -m jobagent watch` - alert + apply the moment a matching job opens.
+watch:
+  interval_minutes: 10            # how often watched boards are checked (min 2). 5-15 is polite + fast enough
+  discovery_every_hours: 12       # Claude web search adds new companies to the watch list; 0 = off
+  remotive_every_hours: 6         # remote-jobs feed (manual apply only); 0 = off
+  include_existing_on_first_run: false  # jobs already open when you start watching are not applied to...
+  fresh_hours: 24                 # ...except ones posted within the last 24h
+  auto_apply: true                # tailor resume + apply as soon as a match appears
+  auto_submit: true               # false = prepare everything and alert you; you finish with `apply --job KEY`
+  max_applications_per_day: 15    # rolling 24h cap (also respected by `apply`)
+  min_score: 75                   # apply threshold while watching (default: apply.min_score)
+  alert_min_score: 65             # also alert (without applying) for decent-but-not-great matches
+
+# Where alerts go. Every enabled channel gets every alert. Secrets come from environment variables.
+notify:
+  console: true
+  desktop: true                   # Linux notify-send / macOS notification centre
+  ntfy_topic: ""                  # easiest phone push: install the free "ntfy" app, subscribe to a long random
+                                  # topic name (anyone who knows the name can read it) and put it here
+  telegram: false                 # needs env TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+  webhook: false                  # Slack or Discord incoming webhook in env JOBAGENT_WEBHOOK_URL
+  email:
+    smtp_host: ""                 # e.g. smtp.gmail.com (use an app password in env SMTP_PASSWORD)
+    smtp_port: 587
+    username: ""
+    to: ""

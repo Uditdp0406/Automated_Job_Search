@@ -92,7 +92,7 @@ BAD_TITLES = ["Sales Manager", "Graphic Designer", "Staff Nurse", "Account Execu
 LOCS = ["Bengaluru, India", "Remote", "Hyderabad, India", "Berlin, Germany", "Remote - US only", "New York, NY"]
 
 
-def make_jobs(rng: random.Random, n: int, port: int) -> list[JobPosting]:
+def make_jobs(rng: random.Random, n: int, port: int, start: int = 0, max_age: int = 80) -> list[JobPosting]:
     jobs = []
     now = datetime.now(timezone.utc)
     for i in range(n):
@@ -109,7 +109,7 @@ def make_jobs(rng: random.Random, n: int, port: int) -> list[JobPosting]:
                 "\n- 3+ years building production services\n" + "\n".join(extra))
         source = rng.choice(["greenhouse", "greenhouse", "lever", "lever", "remotive"])
         slug = re.sub(r"[^a-z]", "", company.lower())
-        jid = str(1000 + i)
+        jid = str(1000 + start + i)
         if source == "lever":
             url = f"http://127.0.0.1:{port}/lever/{slug}/{jid}"
             apply_url = url  # job page first, then "Apply for this job"
@@ -120,7 +120,7 @@ def make_jobs(rng: random.Random, n: int, port: int) -> list[JobPosting]:
         jobs.append(JobPosting(
             source=source, source_id=f"{slug}/{jid}", company=company, title=title, location=loc,
             url=url, apply_url=apply_url, description=desc, remote="remote" in loc.lower(),
-            posted_at=(now - timedelta(days=rng.randint(1, 80))).isoformat(),
+            posted_at=(now - timedelta(days=rng.randint(1, max_age) if max_age else 0)).isoformat(),
         ))
     return jobs
 
@@ -314,12 +314,84 @@ class MockLLM:
         return FormAnswers(answers=answers, needs_human=needs)
 
 
+# ------------------------------------------------------------------------------------ watch demo --
+def _print_submissions() -> None:
+    print(f"\n### WHAT THE FAKE COMPANY SITES RECEIVED ({len(SUBMISSIONS)} submissions)")
+    for s in SUBMISSIONS:
+        print(f"- {s['path']}")
+        print(f"    files : {s['files']}")
+        shown = {k: (v[:60] + '…' if len(v) > 60 else v) for k, v in s["fields"].items()}
+        print(f"    fields: {shown}")
+
+
+def run_watch_demo(agent, resume_file, jobs, rng, port, cand, out, server) -> int:
+    """Existing jobs are baselined; then new random postings 'open' between checks."""
+    from jobagent.cli import _print_status
+    from jobagent.notify import Notifier, NotifyConfig
+    from jobagent.watcher import Watcher
+
+    slugs = sorted({re.sub(r"[^a-z]", "", c.lower()) for c in COMPANIES})
+    agent.s.search.greenhouse_boards = slugs
+    agent.s.search.lever_companies = slugs
+    agent.s.search.use_remotive = False
+    agent.s.search.use_web_discovery = False
+    agent.s.watch.interval_minutes = 5
+
+    live = {(j.source, j.source_id.split("/")[0]): [] for j in jobs}
+    for j in jobs:
+        live.setdefault((j.source, j.source_id.split("/")[0]), []).append(j)
+    sources.poll_greenhouse = lambda b, with_content=True: list(live.get(("greenhouse", b), []))
+    sources.poll_lever = lambda c: list(live.get(("lever", c), []))
+    sources.greenhouse_details = lambda j: j
+
+    def open_jobs(new: list[JobPosting]):
+        for j in new:
+            JOBS_BY_PATH[j.source_id] = j
+            live.setdefault((j.source, j.source_id.split("/")[0]), []).append(j)
+            print(f"   + opened: [{j.source}] {j.company} — {j.title} ({j.location})")
+
+    wave = [0]
+
+    def fake_sleep(seconds: float):
+        wave[0] += 1
+        print(f"\n... {seconds / 60:.1f} minutes pass ...")
+        if wave[0] == 1:
+            new = make_jobs(rng, 4, port, start=500, max_age=0)
+            sure = [j.model_copy(update={"source": src, "location": "Bengaluru, India", "remote": False,
+                                         "title": "Backend Engineer",
+                                         "description": f"{j.company} is hiring a Backend Engineer.\nRequirements:\n- "
+                                                        + "\n- ".join(cand["skills"][:4])})
+                    for j, src in zip(make_jobs(rng, 2, port, start=600, max_age=0), ("greenhouse", "lever"))]
+            for j in sure:  # fix up URLs to match the source we picked
+                slug, jid = j.source_id.split("/")
+                u = f"http://127.0.0.1:{port}/{j.source}/{slug}/{jid}"
+                j.url = j.apply_url = u
+            opened = [j for j in new if j.source != "remotive"] + sure
+            print(f"   {len(opened)} new jobs are posted:")
+            open_jobs(opened)
+        else:
+            print("   (no new jobs this time)")
+
+    agent.analyze(resume_file)
+    print(f"\n### WATCH MODE  - {len(slugs) * 2} company boards, {len(jobs)} jobs already open")
+    print("Check #1 records what is already open (no applications); new postings after that trigger "
+          "alert -> score -> tailor -> apply.\n")
+    Watcher(agent, notifier=Notifier(NotifyConfig(console=True, desktop=False))).run(max_cycles=3, sleep=fake_sleep)
+    print("\n### STATUS")
+    _print_status(agent.tracker)
+    _print_submissions()
+    print(f"\nMock-Claude calls: {agent.llm.calls}")
+    server.shutdown()
+    return 0
+
+
 # ------------------------------------------------------------------------------------------ main --
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--jobs", type=int, default=30)
     ap.add_argument("--out", default="demo_output")
+    ap.add_argument("--watch", action="store_true", help="demo watch mode: new jobs open while the agent watches")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     out = Path(args.out).resolve()
@@ -384,6 +456,8 @@ def main() -> int:
 
     agent = Agent(settings)
     agent.llm = MockLLM(cand, profile)
+    if args.watch:
+        return run_watch_demo(agent, resume_file, jobs, rng, port, cand, out, server)
 
     print(f"\n### 1. ANALYZE  (resume: {resume_file})")
     _print_profile(agent.analyze(resume_file))

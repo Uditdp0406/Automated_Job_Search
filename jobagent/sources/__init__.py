@@ -47,42 +47,75 @@ def age_days(posted_at: str) -> float | None:
     return (datetime.now(timezone.utc) - dt).total_seconds() / 86400
 
 
+class BoardNotFound(Exception):
+    """The company board doesn't exist (HTTP 404) - stop polling it."""
+
+
+def _strict_get(url: str, params: dict | None = None):
+    try:
+        return http_get_json(url, params)
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 404:
+            raise BoardNotFound(url) from e
+        raise
+
+
 # -------------------------------------------------------------- Greenhouse --
+def _gh_job(board: str, j: dict) -> JobPosting:
+    loc = (j.get("location") or {}).get("name", "")
+    return JobPosting(
+        source="greenhouse",
+        source_id=f"{board}/{j['id']}",
+        company=j.get("company_name") or board,
+        title=j.get("title", ""),
+        location=loc,
+        url=j.get("absolute_url", ""),
+        # absolute_url is often the company's own careers page (form in an iframe or elsewhere);
+        # the embed URL is always Greenhouse's own hosted application form.
+        apply_url=f"https://boards.greenhouse.io/embed/job_app?for={board}&token={j['id']}",
+        description=html_to_text(j.get("content", "")),
+        remote="remote" in loc.lower(),
+        posted_at=j.get("first_published") or j.get("updated_at", ""),
+    )
+
+
+def poll_greenhouse(board: str, with_content: bool = True) -> list[JobPosting]:
+    """Strict version used by the watcher: raises BoardNotFound / httpx errors.
+    with_content=False is a much lighter request (titles + locations only)."""
+    params = {"content": "true"} if with_content else None
+    data = _strict_get(f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs", params)
+    return [_gh_job(board, j) for j in data.get("jobs", [])]
+
+
+def greenhouse_details(job: JobPosting) -> JobPosting:
+    """Fill in the description of a posting fetched with with_content=False."""
+    board, jid = job.source_id.split("/", 1)
+    data = http_get_json(f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs/{jid}")
+    return _gh_job(board, data)
+
+
 def fetch_greenhouse(board: str) -> list[JobPosting]:
     """Public Greenhouse Job Board API: https://developers.greenhouse.io/job-board.html"""
     try:
-        data = http_get_json(f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs", {"content": "true"})
-    except httpx.HTTPError as e:
+        return poll_greenhouse(board)
+    except (httpx.HTTPError, BoardNotFound) as e:
         log.warning("greenhouse board %s: %s", board, e)
         return []
-    jobs = []
-    for j in data.get("jobs", []):
-        loc = (j.get("location") or {}).get("name", "")
-        jobs.append(JobPosting(
-            source="greenhouse",
-            source_id=f"{board}/{j['id']}",
-            company=j.get("company_name") or board,
-            title=j.get("title", ""),
-            location=loc,
-            url=j.get("absolute_url", ""),
-            # absolute_url is often the company's own careers page (form in an iframe or elsewhere);
-            # the embed URL is always Greenhouse's own hosted application form.
-            apply_url=f"https://boards.greenhouse.io/embed/job_app?for={board}&token={j['id']}",
-            description=html_to_text(j.get("content", "")),
-            remote="remote" in loc.lower(),
-            posted_at=j.get("updated_at", ""),
-        ))
-    return jobs
 
 
 # ------------------------------------------------------------------- Lever --
 def fetch_lever(company: str) -> list[JobPosting]:
     """Public Lever Postings API: https://github.com/lever/postings-api"""
     try:
-        data = http_get_json(f"https://api.lever.co/v0/postings/{company}", {"mode": "json"})
-    except httpx.HTTPError as e:
+        return poll_lever(company)
+    except (httpx.HTTPError, BoardNotFound) as e:
         log.warning("lever company %s: %s", company, e)
         return []
+
+
+def poll_lever(company: str) -> list[JobPosting]:
+    """Strict version used by the watcher: raises BoardNotFound / httpx errors."""
+    data = _strict_get(f"https://api.lever.co/v0/postings/{company}", {"mode": "json"})
     jobs = []
     for j in data:
         cats = j.get("categories") or {}

@@ -20,6 +20,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     notes TEXT,
     created_at TEXT, updated_at TEXT
 );
+-- Company boards the watcher polls (from config + web discovery).
+CREATE TABLE IF NOT EXISTS boards (
+    source TEXT NOT NULL, slug TEXT NOT NULL,
+    origin TEXT,                 -- config | discovered
+    added_at TEXT, baselined_at TEXT, last_polled_at TEXT,
+    last_error TEXT, disabled INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (source, slug)
+);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+-- Every posting key the watcher has ever seen, relevant or not (so old jobs never look "new").
+CREATE TABLE IF NOT EXISTS seen (key TEXT PRIMARY KEY, first_seen TEXT);
 """
 
 
@@ -32,6 +43,10 @@ class Tracker:
         self.conn = sqlite3.connect(str(path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(jobs)")}
+        if "applied_at" not in cols:  # migrate databases created by older versions
+            self.conn.execute("ALTER TABLE jobs ADD COLUMN applied_at TEXT")
+            self.conn.commit()
 
     def has(self, key: str) -> bool:
         return self.conn.execute("SELECT 1 FROM jobs WHERE key=?", (key,)).fetchone() is not None
@@ -56,6 +71,8 @@ class Tracker:
 
     def update(self, key: str, **fields) -> None:
         fields["updated_at"] = _now()
+        if fields.get("status") == "applied":
+            fields.setdefault("applied_at", fields["updated_at"])
         cols = ", ".join(f"{k}=?" for k in fields)
         self.conn.execute(f"UPDATE jobs SET {cols} WHERE key=?", (*fields.values(), key))
         self.conn.commit()
@@ -82,3 +99,51 @@ class Tracker:
 
     def export_json(self) -> str:
         return json.dumps([dict(r) for r in self.all()], indent=2)
+
+    # ------------------------------------------------------------ watcher state --
+    def add_board(self, source: str, slug: str, origin: str) -> bool:
+        cur = self.conn.execute("INSERT OR IGNORE INTO boards(source,slug,origin,added_at) VALUES(?,?,?,?)",
+                                (source, slug.lower(), origin, _now()))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def boards(self, include_disabled: bool = False) -> list[sqlite3.Row]:
+        q = "SELECT * FROM boards" + ("" if include_disabled else " WHERE disabled=0") + " ORDER BY source, slug"
+        return self.conn.execute(q).fetchall()
+
+    def board_update(self, source: str, slug: str, **fields) -> None:
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.conn.execute(f"UPDATE boards SET {cols} WHERE source=? AND slug=?", (*fields.values(), source, slug))
+        self.conn.commit()
+
+    def meta_get(self, k: str) -> Optional[str]:
+        row = self.conn.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+        return row[0] if row else None
+
+    def meta_set(self, k: str, v: str) -> None:
+        self.conn.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+        self.conn.commit()
+
+    def applied_since(self, iso_ts: str) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM jobs WHERE status='applied' AND applied_at >= ?",
+                                 (iso_ts,)).fetchone()[0]
+
+    def add_seen(self, job: JobPosting, status: str) -> None:
+        """Record a posting as already seen (e.g. it existed before watching started) without scoring it."""
+        if self.add(job):
+            self.update(job.key, status=status)
+
+    def unseen(self, keys: list[str]) -> set[str]:
+        if not keys:
+            return set()
+        have = set()
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            q = ",".join("?" * len(chunk))
+            have |= {r[0] for r in self.conn.execute(f"SELECT key FROM seen WHERE key IN ({q})", chunk)}
+        return set(keys) - have
+
+    def mark_seen(self, keys: list[str]) -> None:
+        now = _now()
+        self.conn.executemany("INSERT OR IGNORE INTO seen(key, first_seen) VALUES(?,?)", [(k, now) for k in keys])
+        self.conn.commit()
